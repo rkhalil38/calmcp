@@ -30,9 +30,8 @@ impl CalMcp {
         let summaries: Vec<CalendarSummary> = calendars
             .into_iter()
             .map(|c| {
-                let id = c.href.trim_end_matches('/').rsplit('/').next().unwrap_or(&c.href).to_string();
-                let name = c.name.unwrap_or_else(|| id.clone());
-                CalendarSummary { id, name }
+                let name = c.name.unwrap_or_else(|| c.href.clone());
+                CalendarSummary { id: c.href, name }
             })
         .collect();
 
