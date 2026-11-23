@@ -15,7 +15,11 @@ log = "0.4.35"
 rmcp = { version = "3.11.0", features = ["server", "transport-streamable-http-server"] }
 serde = "1.0.229"
 thiserror = "2.0.21"
-tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "time"] }
 uuid = { version = "1", features = ["v4"] }
 tower-http = { version = "0.7.1", features = ["auth"] }
 subtle = "2"
+rrule = "0.14.0"
+http-body-util = "0.1.5"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"

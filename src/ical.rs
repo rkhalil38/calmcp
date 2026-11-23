@@ -8,12 +8,16 @@
 use jiff::civil::{Date, DateTime};
 use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp, ZonedDateTime};
+use log::warn;
+use std::collections::HashSet;
 
 #[derive(Debug)]
 pub struct Calendar {
     pub href: String,
     pub name: Option<String>,
     pub color: Option<String>,
+    /// A subscription to an external .ics feed (webcal), which is read-only.
+    pub subscribed: bool,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -32,6 +36,9 @@ pub struct Event {
     /// (TRANSP is ignored: some feeds mark everything transparent); all-day
     /// events only do when explicitly marked TRANSP:OPAQUE.
     pub busy: bool,
+    /// Set for events from a subscribed calendar feed, which can't be edited.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 impl Event {
@@ -84,6 +91,8 @@ pub enum IcalError {
     NoEvent,
     #[error("no occurrence with recurrence_id {0}")]
     OccurrenceNotFound(String),
+    #[error("invalid RRULE: {0}")]
+    InvalidRule(String),
     #[error("invalid date/time: {0}")]
     Time(#[from] jiff::Error),
 }
@@ -161,42 +170,218 @@ pub fn parse_events(
 
     let mut events = Vec::new();
     for ev in cal.blocks("VEVENT") {
-        let (start, end) = event_times(ev, tz)?;
-        let time = match (start, end) {
-            (Time::Date(start), Time::Date(end)) => EventTime::AllDay { start, end },
-            (Time::Zoned(start), Time::Zoned(end)) => EventTime::Timed { start, end },
-            _ => return Err(IcalError::MixedValueTypes),
-        };
-
-        let cancelled = ev
-            .prop("STATUS")
-            .is_some_and(|p| p.value.eq_ignore_ascii_case("CANCELLED"));
-        let busy = !cancelled
-            && match time {
-                EventTime::Timed { .. } => true,
-                EventTime::AllDay { .. } => ev
-                    .prop("TRANSP")
-                    .is_some_and(|p| p.value.eq_ignore_ascii_case("OPAQUE")),
-            };
-
         let recurrence_id = ev.prop("RECURRENCE-ID").map(|p| p.value.to_string());
-        events.push(Event {
-            id: href.to_string(),
-            etag: etag.to_string(),
-            uid: ev
-                .prop("UID")
-                .map(|p| p.value.to_string())
-                .unwrap_or_default(),
-            summary: ev.text("SUMMARY").unwrap_or_else(|| "(untitled)".into()),
-            time,
-            location: ev.text("LOCATION"),
-            description: ev.text("DESCRIPTION"),
-            recurring: recurrence_id.is_some(),
-            recurrence_id,
-            busy,
-        });
+        events.push(to_event(ev, href, etag, event_times(ev, tz)?, recurrence_id)?);
     }
     Ok(events)
+}
+
+/// Build an `Event` for one occurrence of `ev`, running from `start` to `end`.
+fn to_event(
+    ev: &Block,
+    id: &str,
+    etag: &str,
+    (start, end): (Time, Time),
+    recurrence_id: Option<String>,
+) -> Result<Event, IcalError> {
+    let time = match (start, end) {
+        (Time::Date(start), Time::Date(end)) => EventTime::AllDay { start, end },
+        (Time::Zoned(start), Time::Zoned(end)) => EventTime::Timed { start, end },
+        _ => return Err(IcalError::MixedValueTypes),
+    };
+
+    let cancelled = ev
+        .prop("STATUS")
+        .is_some_and(|p| p.value.eq_ignore_ascii_case("CANCELLED"));
+    let busy = !cancelled
+        && match time {
+            EventTime::Timed { .. } => true,
+            EventTime::AllDay { .. } => ev
+                .prop("TRANSP")
+                .is_some_and(|p| p.value.eq_ignore_ascii_case("OPAQUE")),
+        };
+
+    Ok(Event {
+        id: id.to_string(),
+        etag: etag.to_string(),
+        uid: uid_of(ev),
+        summary: ev.text("SUMMARY").unwrap_or_else(|| "(untitled)".into()),
+        time,
+        location: ev.text("LOCATION"),
+        description: ev.text("DESCRIPTION"),
+        recurring: recurrence_id.is_some(),
+        recurrence_id,
+        busy,
+        read_only: false,
+    })
+}
+
+fn uid_of(ev: &Block) -> String {
+    ev.prop("UID").map(|p| p.value.to_string()).unwrap_or_default()
+}
+
+/// Most occurrences of one recurring event to return from a feed.
+const MAX_OCCURRENCES: u16 = 2000;
+
+/// Parse a subscribed calendar feed (a plain .ics file) into read-only events,
+/// including at least every occurrence overlapping `[start, end)`.
+///
+/// Unlike CalDAV collections, the server doesn't expand feeds for us, so
+/// recurring events (RRULE/RDATE/EXDATE, with RECURRENCE-ID overrides) are
+/// expanded here. Events that can't be read are skipped with a warning.
+pub fn parse_feed(
+    calendar_id: &str,
+    ics: &str,
+    tz: &TimeZone,
+    start: Timestamp,
+    end: Timestamp,
+) -> Result<Vec<Event>, IcalError> {
+    let cal = parse_calendar(ics)?;
+
+    // Occurrences replaced by an override VEVENT, so the series skips them.
+    let overridden: HashSet<(String, Timestamp)> = cal
+        .blocks("VEVENT")
+        .filter_map(|ev| {
+            let rid = ev.prop("RECURRENCE-ID")?.time(tz).ok()?;
+            Some((uid_of(ev), rid.timestamp(tz).ok()?))
+        })
+        .collect();
+
+    let mut events = Vec::new();
+    for ev in cal.blocks("VEVENT") {
+        let uid = uid_of(ev);
+        let id = format!("{calendar_id}#{uid}");
+        let read = || -> Result<Vec<Event>, IcalError> {
+            let times = event_times(ev, tz)?;
+            let is_series = ev.prop("RECURRENCE-ID").is_none()
+                && (ev.prop("RRULE").is_some() || ev.prop("RDATE").is_some());
+            if !is_series {
+                let rid = ev.prop("RECURRENCE-ID").map(|p| p.value.to_string());
+                return Ok(vec![to_event(ev, &id, "", times, rid)?]);
+            }
+
+            let mut out = Vec::new();
+            for occ in expand(ev, &times, tz, start, end)? {
+                if overridden.contains(&(uid.clone(), occ.timestamp(tz)?)) {
+                    continue;
+                }
+                let occ_end = shift(&times.1, &times.0, &occ)?;
+                let rid = match &occ {
+                    Time::Date(d) => d.strftime("%Y%m%d").to_string(),
+                    Time::Zoned(z) => z.timestamp().strftime("%Y%m%dT%H%M%SZ").to_string(),
+                };
+                out.push(to_event(ev, &id, "", (occ, occ_end), Some(rid))?);
+            }
+            Ok(out)
+        };
+        match read() {
+            Ok(evs) => events.extend(evs.into_iter().map(|e| Event { read_only: true, ..e })),
+            Err(e) => warn!("skipping feed event {uid:?}: {e}"),
+        }
+    }
+    Ok(events)
+}
+
+/// The start times of the occurrences of the recurring event `ev` (whose
+/// first occurrence is `first`) that may overlap `[start, end)`.
+fn expand(
+    ev: &Block,
+    first: &(Time, Time),
+    tz: &TimeZone,
+    start: Timestamp,
+    end: Timestamp,
+) -> Result<Vec<Time>, IcalError> {
+    // Recurrence rules apply to wall-clock time in DTSTART's own timezone.
+    // All-day series are expanded in UTC, where a date is midnight.
+    let zone = match &first.0 {
+        Time::Date(_) => TimeZone::UTC,
+        Time::Zoned(_) => {
+            let dtstart = ev.prop("DTSTART").ok_or(IcalError::MissingStart)?;
+            value_zone(&dtstart, tz)?
+        }
+    };
+    let rtz = zone
+        .iana_name()
+        .and_then(|name| name.parse::<chrono_tz::Tz>().ok())
+        .map(rrule::Tz::from)
+        .unwrap_or(rrule::Tz::UTC);
+
+    let instant = |t: &Time| -> Result<Timestamp, IcalError> {
+        Ok(match t {
+            Time::Date(d) => d.to_zoned_datetime(TimeZone::UTC)?.timestamp(),
+            Time::Zoned(z) => z.timestamp(),
+        })
+    };
+    let to_rrule = |ts: Timestamp| -> Result<chrono::DateTime<rrule::Tz>, IcalError> {
+        chrono::DateTime::from_timestamp(ts.as_second(), 0)
+            .map(|dt| dt.with_timezone(&rtz))
+            .ok_or(IcalError::InvalidIcs("date out of range"))
+    };
+    let from_rrule = |dt: chrono::DateTime<rrule::Tz>| -> Result<Time, IcalError> {
+        let ts = Timestamp::from_second(dt.timestamp())?;
+        Ok(match first.0 {
+            Time::Date(_) => Time::Date(ts.to_zoned_datetime(TimeZone::UTC).date()),
+            Time::Zoned(_) => Time::Zoned(ts.to_zoned_datetime(tz.clone())),
+        })
+    };
+
+    let dtstart = to_rrule(instant(&first.0)?)?;
+    // RFC 5545 3.8.5.3: DTSTART is always the first occurrence.
+    let mut set = rrule::RRuleSet::new(dtstart).rdate(dtstart);
+    for p in ev.props("RRULE") {
+        let rule: rrule::RRule<rrule::Unvalidated> = until_in_utc(p.value, &zone, &first.0)?
+            .parse()
+            .map_err(|e: rrule::RRuleError| IcalError::InvalidRule(e.to_string()))?;
+        let rule = rule
+            .validate(dtstart)
+            .map_err(|e| IcalError::InvalidRule(e.to_string()))?;
+        set = set.rrule(rule);
+    }
+    for (name, p) in ev.props("RDATE").map(|p| ("RDATE", p)).chain(ev.props("EXDATE").map(|p| ("EXDATE", p))) {
+        // RDATE;VALUE=PERIOD (start/end) isn't supported; its starts are skipped.
+        for value in p.value.split(',').filter(|v| !v.contains('/')) {
+            let dt = to_rrule(instant(&parse_value(value, p.param("TZID"), tz)?)?)?;
+            set = if name == "RDATE" { set.rdate(dt) } else { set.exdate(dt) };
+        }
+    }
+
+    let length = first.1.timestamp(tz)?.duration_since(first.0.timestamp(tz)?);
+    let margin = jiff::SignedDuration::from_hours(24);
+    let after = start.saturating_sub(length.abs())?.saturating_sub(margin)?;
+    let before = end.saturating_add(margin)?;
+    let result = set.after(to_rrule(after)?).before(to_rrule(before)?).all(MAX_OCCURRENCES);
+    if result.limited {
+        warn!("recurring event {:?} has over {MAX_OCCURRENCES} occurrences in range; truncating", uid_of(ev));
+    }
+
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for dt in result.dates {
+        if seen.insert(dt.timestamp()) {
+            out.push(from_rrule(dt)?);
+        }
+    }
+    Ok(out)
+}
+
+/// Rewrite an RRULE's UNTIL as a UTC date-time, which is what the rrule crate
+/// expects. A date-only UNTIL is inclusive of that whole day.
+fn until_in_utc(rule: &str, zone: &TimeZone, dtstart: &Time) -> Result<String, IcalError> {
+    let parts: Result<Vec<String>, IcalError> = rule
+        .split(';')
+        .map(|part| {
+            let Some(value) = strip_prefix_ci(part, "UNTIL=") else {
+                return Ok(part.to_string());
+            };
+            let until = match (parse_value(value, None, zone)?, dtstart) {
+                (Time::Zoned(z), _) => z.timestamp(),
+                (Time::Date(d), Time::Date(_)) => d.to_zoned_datetime(TimeZone::UTC)?.timestamp(),
+                (Time::Date(d), Time::Zoned(_)) => d.to_zoned_datetime(zone.clone())?.end_of_day()?.timestamp(),
+            };
+            Ok(format!("UNTIL={}", until.strftime("%Y%m%dT%H%M%SZ")))
+        })
+        .collect();
+    Ok(parts?.join(";"))
 }
 
 /// An event's start and end. A missing end follows RFC 5545 3.6.1: one day
@@ -572,6 +757,14 @@ impl Block {
         })
     }
 
+    /// Every top-level property with this name.
+    fn props<'a>(&'a self, name: &'a str) -> impl Iterator<Item = Prop<'a>> {
+        self.lines.iter().filter_map(move |l| match l {
+            Line::Prop(p) if prop_name(p).eq_ignore_ascii_case(name) => parse_prop(p),
+            _ => None,
+        })
+    }
+
     /// A text property's unescaped value, if present and non-empty.
     fn text(&self, name: &str) -> Option<String> {
         self.prop(name)
@@ -663,6 +856,15 @@ fn parse_value(value: &str, tzid: Option<&str>, tz: &TimeZone) -> Result<Time, I
     };
     let zdt = DateTime::strptime("%Y%m%dT%H%M%S", civil)?.to_zoned_datetime(zone)?;
     Ok(Time::Zoned(zdt.with_time_zone(tz.clone())))
+}
+
+/// The timezone a DATE-TIME property is written in.
+fn value_zone(prop: &Prop, tz: &TimeZone) -> Result<TimeZone, IcalError> {
+    Ok(match prop.param("TZID") {
+        _ if prop.value.ends_with('Z') => TimeZone::UTC,
+        Some(tzid) => TimeZone::get(tzid)?,
+        None => tz.clone(),
+    })
 }
 
 fn prop_name(line: &str) -> &str {
@@ -920,4 +1122,75 @@ END:VCALENDAR\r\n";
             Err(IcalError::EndBeforeStart)
         ));
     }
+
+    fn feed(start: &str, end: &str, ics: &str) -> Vec<Event> {
+        let ts = |s: &str| Time::parse_input(s, &ny()).unwrap().timestamp(&ny()).unwrap();
+        let (start, end) = (ts(start), ts(end));
+        let mut evs: Vec<Event> = parse_feed("/u/canvas/", ics, &ny(), start, end)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.overlaps(start, end, &ny()).unwrap())
+            .collect();
+        evs.sort_by_key(|e| e.interval(&ny()).unwrap().0);
+        evs
+    }
+
+    fn starts(evs: &[Event]) -> Vec<String> {
+        evs.iter()
+            .map(|e| match &e.time {
+                EventTime::AllDay { start, .. } => start.to_string(),
+                EventTime::Timed { start, .. } => start.datetime().to_string(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn feed_reads_canvas_style_events() {
+        let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Instructure//EN\r\n\
+BEGIN:VEVENT\r\nUID:event-assignment-1\r\nDTSTART:20261202T045900Z\r\nDTEND:20261202T045900Z\r\n\
+SUMMARY:Essay 2 [ENGL 101]\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:event-calendar-event-2\r\nDTSTART;VALUE=DATE:20261203\r\nDTEND;VALUE=DATE:20261204\r\n\
+SUMMARY:No class\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:old\r\nDTSTART:20260101T120000Z\r\nSUMMARY:Old\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let evs = feed("2026-12-01", "2026-12-08", ics);
+        assert_eq!(starts(&evs), ["2026-12-01T23:59:00", "2026-12-03"]);
+        assert!(evs.iter().all(|e| e.read_only && !e.recurring));
+        assert_eq!(evs[0].id, "/u/canvas/#event-assignment-1");
+    }
+
+    #[test]
+    fn feed_expands_recurrences_with_exdate_and_override() {
+        // Weekly at 09:00 New York, across the Nov 1 DST change.
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:w\r\n\
+DTSTART;TZID=America/New_York:20261019T090000\r\nDTEND;TZID=America/New_York:20261019T100000\r\n\
+RRULE:FREQ=WEEKLY;UNTIL=20261116T140000Z\r\nEXDATE;TZID=America/New_York:20261026T090000\r\n\
+SUMMARY:Lecture\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:w\r\nRECURRENCE-ID;TZID=America/New_York:20261109T090000\r\n\
+DTSTART;TZID=America/New_York:20261109T130000\r\nDTEND;TZID=America/New_York:20261109T140000\r\n\
+SUMMARY:Lecture (moved)\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let evs = feed("2026-10-01", "2026-12-31", ics);
+        assert_eq!(
+            starts(&evs),
+            ["2026-10-19T09:00:00", "2026-11-02T09:00:00", "2026-11-09T13:00:00", "2026-11-16T09:00:00"]
+        );
+        assert_eq!(evs[1].recurrence_id.as_deref(), Some("20261102T140000Z"));
+        assert!(evs.iter().all(|e| e.recurring));
+        assert_eq!(evs[2].summary, "Lecture (moved)");
+    }
+
+    #[test]
+    fn feed_expands_all_day_series_with_date_until() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:d\r\nDTSTART;VALUE=DATE:20261130\r\n\
+RRULE:FREQ=DAILY;UNTIL=20261202\r\nSUMMARY:Exams\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        let evs = feed("2026-11-01", "2026-12-31", ics);
+        assert_eq!(starts(&evs), ["2026-11-30", "2026-12-01", "2026-12-02"]);
+    }
+
+    #[test]
+    fn feed_skips_unreadable_events() {
+        let ics = "BEGIN:VCALENDAR\r\nBEGIN:VEVENT\r\nUID:bad\r\nSUMMARY:No start\r\nEND:VEVENT\r\n\
+BEGIN:VEVENT\r\nUID:ok\r\nDTSTART:20261201T150000Z\r\nDTEND:20261201T160000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+        assert_eq!(feed("2026-12-01", "2026-12-02", ics).len(), 1);
+    }
+
 }

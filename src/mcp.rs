@@ -11,7 +11,10 @@ use crate::ical::{EventFields, Time};
 #[derive(serde::Serialize)]
 struct CalendarSummary {
     id: String,
-    name: String
+    name: String,
+    /// A subscribed (webcal) calendar, whose events can be read but not changed.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    read_only: bool,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -104,7 +107,8 @@ impl CalMcp {
         Self { client, tz }
     }
 
-    #[tool(description = "List the user's calendars.")]
+    #[tool(description = "List the user's calendars, including subscribed (webcal) calendars, \
+        which are marked read_only: their events can be listed but not created, updated or deleted.")]
     async fn list_calendars(&self) -> Result<String, String> {
         let calendars = list_calendars(&self.client)
             .await
@@ -114,7 +118,7 @@ impl CalMcp {
             .into_iter()
             .map(|c| {
                 let name = c.name.unwrap_or_else(|| c.href.clone());
-                CalendarSummary { id: c.href, name }
+                CalendarSummary { id: c.href, name, read_only: c.subscribed }
             })
         .collect();
 

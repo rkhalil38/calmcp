@@ -121,6 +121,7 @@ mod tests {
             recurring: false,
             recurrence_id: None,
             busy,
+            read_only: false,
         }
     }
 

@@ -13,6 +13,7 @@ use tower_http::auth::AddAuthorization;
 use crate::mcp::CalMcp;
 
 mod dav;
+mod feed;
 mod free;
 mod mcp;
 mod ical;

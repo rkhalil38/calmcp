@@ -6,12 +6,14 @@ A stateless [MCP](https://modelcontextprotocol.io) server for CalDAV.
 
 | Tool | Description |
 |---|---|
-| `list_calendars` | List the user's calendars. |
+| `list_calendars` | List the user's calendars, including subscribed (webcal) calendars, which are marked `read_only`. |
 | `list_events` | List events in a time range. Recurring events are expanded by the CalDAV server. |
 | `create_event` | Create an event. Returns its id and etag. |
 | `update_event` | Update an event, a whole recurring series, or a single occurrence. Only the given fields change. |
 | `delete_event` | Delete an event, a whole recurring series, or a single occurrence. |
 | `find_free_time` | Find free slots across calendars, optionally limited to daily hours (e.g. 09:00–17:00). |
+
+Subscribed calendars (e.g. a Canvas or holiday webcal feed added in Radicale's web UI) are fetched directly from their feed URL, without the CalDAV credentials, and their recurring events are expanded by calmcp. They can be listed and are included in `find_free_time`, but can't be modified.
 
 Times can be given as `YYYY-MM-DD` (all-day), `YYYY-MM-DDTHH:MM` (local time in `TZ`), or RFC 3339.
 

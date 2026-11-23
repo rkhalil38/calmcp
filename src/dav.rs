@@ -7,11 +7,14 @@ use hyper_util::client::legacy::{
     connect::{HttpConnector, dns::GaiResolver},
 };
 use libdav::{
-    CalDavClient, PropertyName,
+    CalDavClient, Depth, PropertyName,
     caldav::{
         FindCalendarHomeSet, FindCalendars, GetCalendarResources, GetCalendarResourcesResponse,
     },
-    dav::{Delete, FindCurrentUserPrincipalError, PutResource, WebDavError, make_relative_url},
+    dav::{
+        Delete, FindCollections, FindCurrentUserPrincipalError, Propfind, PutResource, WebDavError,
+        make_relative_url,
+    },
     names,
     requests::{DavRequest, ParseResponseError, xml_content_type_header},
     xmlutils::XmlNode,
@@ -20,7 +23,8 @@ use log::warn;
 use thiserror::Error;
 use tower_http::auth::AddAuthorization;
 
-use crate::ical::{self, Calendar, Event, EventFields, IcalError, parse_events};
+use crate::feed::{self, FeedError};
+use crate::ical::{self, Calendar, Event, EventFields, IcalError, parse_events, parse_feed};
 
 type AuthedHttp = AddAuthorization<Client<HttpsConnector<HttpConnector<GaiResolver>>, String>>;
 
@@ -45,6 +49,12 @@ pub enum DavError {
 
     #[error("invalid date/time: {0}")]
     Time(#[from] jiff::Error),
+
+    #[error("could not fetch the subscribed calendar: {0}")]
+    Feed(#[from] FeedError),
+
+    #[error("this calendar is a read-only subscription")]
+    ReadOnly,
 }
 
 /// The result of writing an event.
@@ -58,6 +68,12 @@ pub struct Saved {
 const ICS_CONTENT_TYPE: &str = "text/calendar; charset=utf-8";
 
 const EXPAND: PropertyName = PropertyName::new(names::CALDAV, "expand");
+
+/// Resource type of a subscription to an external .ics feed (webcal), as
+/// created by Radicale's web UI or Apple Calendar.
+const SUBSCRIBED: PropertyName = PropertyName::new(names::CALENDAR_SERVER, "subscribed");
+/// The URL of a subscription's feed, in a `<D:href>`.
+const SOURCE: PropertyName = PropertyName::new(names::CALENDAR_SERVER, "source");
 
 fn to_caldav(ts: jiff::Timestamp) -> String {
     ts.strftime("%Y%m%dT%H%M%SZ").to_string()
@@ -138,6 +154,10 @@ pub async fn list_calendars(client: &CalDav) -> Result<Vec<Calendar>, DavError> 
         None => vec![client.webdav_client.base_url().clone()],
     };
 
+    let prop = |props: &[(&PropertyName, Option<String>)], name| {
+        props.iter().find(|(p, _)| **p == name).and_then(|(_, v)| v.clone())
+    };
+
     let mut out = Vec::new();
     for home in home_sets {
         for cal in client
@@ -146,19 +166,29 @@ pub async fn list_calendars(client: &CalDav) -> Result<Vec<Calendar>, DavError> 
             .await?
             .calendars
         {
-            let prop = |name| {
-                cal.properties
-                    .iter()
-                    .find(|(p, _)| **p == name)
-                    .and_then(|(_, v)| v.clone())
-            };
-            let name = prop(names::DISPLAY_NAME);
-            let color = prop(names::CALENDAR_COLOUR);
-
             out.push(Calendar {
+                name: prop(&cal.properties, names::DISPLAY_NAME),
+                color: prop(&cal.properties, names::CALENDAR_COLOUR),
                 href: cal.href,
-                name,
-                color,
+                subscribed: false,
+            });
+        }
+
+        let subscriptions = client
+            .webdav_client
+            .request(
+                FindCollections::new(home.path())
+                    .with_collection_type(&SUBSCRIBED)
+                    .with_additional_properties(&[&names::DISPLAY_NAME, &names::CALENDAR_COLOUR]),
+            )
+            .await?
+            .collections;
+        for sub in subscriptions {
+            out.push(Calendar {
+                name: prop(&sub.properties, names::DISPLAY_NAME),
+                color: prop(&sub.properties, names::CALENDAR_COLOUR),
+                href: sub.href,
+                subscribed: true,
             });
         }
     }
@@ -176,6 +206,30 @@ pub async fn list_events(
     // The server compares all-day (floating) dates as if they were UTC, which
     // shifts them by our UTC offset. Query a day wider on each side, then
     // filter against the real range using dates local to `tz`.
+    let events = match subscription_source(client, calendar_id).await? {
+        Some(url) => parse_feed(calendar_id, &feed::fetch(&url).await?, tz, start, end)?,
+        None => fetch_events(client, calendar_id, tz, start, end).await?,
+    };
+
+    let mut kept = Vec::with_capacity(events.len());
+    for ev in events {
+        if ev.overlaps(start, end, tz)? {
+            let (ev_start, _) = ev.interval(tz)?;
+            kept.push((ev_start, ev));
+        }
+    }
+    kept.sort_by_key(|(ev_start, _)| *ev_start);
+    Ok(kept.into_iter().map(|(_, ev)| ev).collect())
+}
+
+/// The events of a CalDAV collection, roughly in `[start, end)`.
+async fn fetch_events(
+    client: &CalDav,
+    calendar_id: &str,
+    tz: &TimeZone,
+    start: jiff::Timestamp,
+    end: jiff::Timestamp,
+) -> Result<Vec<Event>, DavError> {
     let margin = jiff::SignedDuration::from_hours(24);
     let request = ExpandedEvents {
         collection_href: calendar_id,
@@ -196,16 +250,53 @@ pub async fn list_events(
             }
         }
     }
+    Ok(events)
+}
 
-    let mut kept = Vec::with_capacity(events.len());
-    for ev in events {
-        if ev.overlaps(start, end, tz)? {
-            let (ev_start, _) = ev.interval(tz)?;
-            kept.push((ev_start, ev));
-        }
+/// If the collection at `href` is a subscription, the URL of its feed.
+async fn subscription_source(client: &CalDav, href: &str) -> Result<Option<String>, DavError> {
+    let response = client
+        .webdav_client
+        .request(
+            Propfind::new(href)
+                .with_properties(&[&names::RESOURCETYPE, &SOURCE])
+                .with_depth(Depth::Zero),
+        )
+        .await?;
+    let doc = response
+        .xml_tree()
+        .map_err(WebDavError::from)?;
+
+    let subscribed = doc
+        .descendants()
+        .filter(|n| n.tag_name() == names::RESOURCETYPE)
+        .any(|rt| rt.children().any(|n| n.tag_name() == SUBSCRIBED));
+    if !subscribed {
+        return Ok(None);
     }
-    kept.sort_by_key(|(ev_start, _)| *ev_start);
-    Ok(kept.into_iter().map(|(_, ev)| ev).collect())
+
+    // Normally `<CS:source><D:href>url</D:href></CS:source>`; accept bare text too.
+    let source = doc
+        .descendants()
+        .find(|n| n.tag_name() == SOURCE)
+        .and_then(|s| {
+            s.descendants()
+                .find(|n| n.tag_name() == names::HREF)
+                .and_then(|h| h.text())
+                .or_else(|| s.text())
+        })
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or(FeedError::InvalidUrl)?;
+    Ok(Some(source.to_string()))
+}
+
+/// Fail with `ReadOnly` if `calendar_id` is a subscription.
+async fn ensure_writable(client: &CalDav, calendar_id: &str) -> Result<(), DavError> {
+    match subscription_source(client, calendar_id).await? {
+        Some(_) => Err(DavError::ReadOnly),
+        None => Ok(()),
+    }
 }
 
 pub async fn create_event(
@@ -214,6 +305,7 @@ pub async fn create_event(
     fields: &EventFields,
     tz: &TimeZone,
 ) -> Result<Saved, DavError> {
+    ensure_writable(client, calendar_id).await?;
     let uid = uuid::Uuid::new_v4().to_string();
     let ics = ical::new_event(&uid, fields, tz)?;
     let href = format!("{}/{uid}.ics", calendar_id.trim_end_matches('/'));
@@ -234,6 +326,7 @@ pub async fn update_event(
     fields: &EventFields,
     tz: &TimeZone,
 ) -> Result<Saved, DavError> {
+    ensure_writable(client, collection_of(id)?).await?;
     if let Some(rid) = recurrence_id {
         check_occurrence(client, id, rid, tz).await?;
     }
@@ -252,6 +345,7 @@ pub async fn delete_event(
     recurrence_id: Option<&str>,
     tz: &TimeZone,
 ) -> Result<Option<Saved>, DavError> {
+    ensure_writable(client, collection_of(id)?).await?;
     if let Some(rid) = recurrence_id {
         check_occurrence(client, id, rid, tz).await?;
         let current = fetch_current(client, id, etag).await?;
@@ -268,7 +362,10 @@ pub async fn delete_event(
     Ok(None)
 }
 
+/// The calendar an event id belongs to. Ids of events from subscriptions are
+/// `<calendar>#<uid>`.
 fn collection_of(id: &str) -> Result<&str, DavError> {
+    let id = id.split_once('#').map_or(id, |(calendar, _)| calendar);
     id.rfind('/').map(|i| &id[..=i]).ok_or(DavError::NotFound)
 }
 
