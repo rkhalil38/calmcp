@@ -1,6 +1,6 @@
 # calmcp
 
-A stateless [MCP](https://modelcontextprotocol.io) server for CalDAV. It's configured entirely through environment variables and serves MCP over streamable HTTP at `/mcp`.
+A stateless [MCP](https://modelcontextprotocol.io) server for CalDAV.
 
 ## Tools
 
