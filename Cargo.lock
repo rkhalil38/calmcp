@@ -221,6 +221,7 @@ dependencies = [
  "log",
  "rmcp",
  "serde",
+ "subtle",
  "thiserror",
  "tokio",
  "tower-http",

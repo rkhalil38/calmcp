@@ -1,11 +1,13 @@
 use std::{env, process::{self, ExitCode}, sync::Arc};
 
-use http::Uri;
+use axum::{extract::{Request, State}, middleware::{self, Next}, response::{IntoResponse, Response}};
+use http::{StatusCode, Uri, header::{AUTHORIZATION, WWW_AUTHENTICATE}};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use libdav::{CalDavClient, dav::WebDavClient};
 use log::{error, info, warn};
 use rmcp::transport::{StreamableHttpServerConfig, StreamableHttpService, streamable_http_server::session::local::LocalSessionManager};
+use subtle::ConstantTimeEq;
 use tower_http::auth::AddAuthorization;
 
 use crate::mcp::CalMcp;
@@ -57,6 +59,16 @@ async fn main() -> ExitCode {
         process::exit(1);
     };
 
+    let Ok(api_key) = env::var("MCP_API_KEY") else {
+        error!("MCP_API_KEY is not set");
+        return ExitCode::FAILURE;
+    };
+    if api_key.is_empty() {
+        error!("MCP_API_KEY must not be empty");
+        return ExitCode::FAILURE;
+    }
+    let api_key: Arc<str> = api_key.into();
+
     let https_connector = HttpsConnectorBuilder::new()
         .with_native_roots()
         .unwrap()
@@ -78,10 +90,28 @@ async fn main() -> ExitCode {
         config
     );
 
-    let router = axum::Router::new().nest_service("/mcp", service);
+    let router = axum::Router::new()
+        .nest_service("/mcp", service)
+        .layer(middleware::from_fn_with_state(api_key, require_api_key));
     let listener = 
         tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await.unwrap();
     axum::serve(listener, router).await.unwrap();
 
     ExitCode::SUCCESS
+}
+
+/// Rejects requests without an `Authorization: Bearer <MCP_API_KEY>` header.
+/// The key is compared in constant time to avoid leaking it through response timing.
+async fn require_api_key(State(key): State<Arc<str>>, req: Request, next: Next) -> Response {
+    let authorized = req
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.as_bytes().strip_prefix(b"Bearer "))
+        .is_some_and(|token| token.ct_eq(key.as_bytes()).into());
+
+    if authorized {
+        next.run(req).await
+    } else {
+        (StatusCode::UNAUTHORIZED, [(WWW_AUTHENTICATE, "Bearer")]).into_response()
+    }
 }
