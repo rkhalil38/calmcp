@@ -58,3 +58,9 @@ MCP will be done through the official [rust-sdk](https://github.com/modelcontext
 ### CalDAV
 
 CalDAV operations will be done through [libdav](https://docs.rs/libdav/latest/libdav/).
+
+#### Recurring events
+
+Recurring events are expanded by the CalDAV server, not by calmcp: `list_events` sends a `calendar-query` with `<C:expand>` (RFC 4791 §9.6.5) and gets back one VEVENT per occurrence, in UTC, with EXDATEs and overridden occurrences already applied. This keeps calmcp free of RRULE/VTIMEZONE logic.
+
+This means calmcp depends on the server implementing `expand` correctly. Verified against Radicale 3.5.4 (DST transitions, EXDATE, moved occurrences, all-day events); other servers are untested. Known quirk: Radicale omits `VALUE=DATE` on expanded all-day values, so `ical::parse_value` detects dates by the value's shape.

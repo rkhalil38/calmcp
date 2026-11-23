@@ -11,13 +11,19 @@ use tower_http::auth::AddAuthorization;
 use crate::mcp::CalMcp;
 
 mod dav;
+mod free;
 mod mcp;
+mod ical;
 
 #[tokio::main]
 async fn main() -> ExitCode {
     env_logger::init();
 
-    let tz: String = env::var("TZ").unwrap_or("Etc/UTC".to_string());
+    let tz_name: String = env::var("TZ").unwrap_or("Etc/UTC".to_string());
+    let Ok(tz) = jiff::tz::TimeZone::get(&tz_name) else {
+        error!("TZ is not a valid IANA timezone: {tz_name}");
+        return ExitCode::FAILURE;
+    };
     let port: u16 = env::var("PORT").unwrap_or("8000".to_string()).parse().unwrap();
 
     let Ok(caldav_url) = env::var("CALDAV_URL") else {
@@ -67,7 +73,7 @@ async fn main() -> ExitCode {
         .with_json_response(true);
 
     let service = StreamableHttpService::new(
-        move || Ok(CalMcp::new(Arc::clone(&client))),
+        move || Ok(CalMcp::new(Arc::clone(&client), tz.clone())),
         LocalSessionManager::default().into(),
         config
     );
