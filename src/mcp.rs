@@ -174,7 +174,7 @@ impl CalMcp {
     }
 
     #[tool(description = "Find free time slots across the user's calendars. Timed events block \
-        time unless marked free; all-day events only block time when marked busy.")]
+        time unless cancelled; all-day events only block time when marked busy.")]
     async fn find_free_time(&self, Parameters(params): Parameters<FindFreeTimeParams>) -> Result<String, String> {
         let instant = |field: &str, value: &str| {
             Time::parse_input(value, &self.tz)

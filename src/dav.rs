@@ -42,6 +42,9 @@ pub enum DavError {
 
     #[error(transparent)]
     Ical(#[from] IcalError),
+
+    #[error("invalid date/time: {0}")]
+    Time(#[from] jiff::Error),
 }
 
 /// The result of writing an event.
@@ -170,10 +173,14 @@ pub async fn list_events(
     start: jiff::Timestamp,
     end: jiff::Timestamp,
 ) -> Result<Vec<Event>, DavError> {
+    // The server compares all-day (floating) dates as if they were UTC, which
+    // shifts them by our UTC offset. Query a day wider on each side, then
+    // filter against the real range using dates local to `tz`.
+    let margin = jiff::SignedDuration::from_hours(24);
     let request = ExpandedEvents {
         collection_href: calendar_id,
-        start: to_caldav(start),
-        end: to_caldav(end),
+        start: to_caldav(start.saturating_sub(margin)?),
+        end: to_caldav(end.saturating_add(margin)?),
     };
     let fetched = client.webdav_client.request(request).await?.resources;
 
@@ -190,7 +197,15 @@ pub async fn list_events(
         }
     }
 
-    Ok(events)
+    let mut kept = Vec::with_capacity(events.len());
+    for ev in events {
+        if ev.overlaps(start, end, tz)? {
+            let (ev_start, _) = ev.interval(tz)?;
+            kept.push((ev_start, ev));
+        }
+    }
+    kept.sort_by_key(|(ev_start, _)| *ev_start);
+    Ok(kept.into_iter().map(|(_, ev)| ev).collect())
 }
 
 pub async fn create_event(

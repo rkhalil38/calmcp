@@ -28,9 +28,31 @@ pub struct Event {
     pub recurring: bool,
     /// Original start of this occurrence (RECURRENCE-ID), identifying it within the series.
     pub recurrence_id: Option<String>,
-    /// Whether the event blocks time. Cancelled and TRANSP:TRANSPARENT events
-    /// don't; all-day events only do when marked TRANSP:OPAQUE.
+    /// Whether the event blocks time. Timed events always do unless cancelled
+    /// (TRANSP is ignored: some feeds mark everything transparent); all-day
+    /// events only do when explicitly marked TRANSP:OPAQUE.
     pub busy: bool,
+}
+
+impl Event {
+    /// The instants this event spans; an all-day event runs from midnight to
+    /// midnight in `tz`.
+    pub fn interval(&self, tz: &TimeZone) -> Result<(Timestamp, Timestamp), jiff::Error> {
+        Ok(match &self.time {
+            EventTime::Timed { start, end } => (start.timestamp(), end.timestamp()),
+            EventTime::AllDay { start, end } => (
+                start.to_zoned_datetime(tz.clone())?.timestamp(),
+                end.to_zoned_datetime(tz.clone())?.timestamp(),
+            ),
+        })
+    }
+
+    /// Whether the event overlaps `[start, end)`. A zero-length event counts
+    /// when it starts inside the range (RFC 4791 9.9).
+    pub fn overlaps(&self, start: Timestamp, end: Timestamp, tz: &TimeZone) -> Result<bool, jiff::Error> {
+        let (ev_start, ev_end) = self.interval(tz)?;
+        Ok(ev_start < end && (ev_end > start || ev_start >= start))
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -150,9 +172,11 @@ pub fn parse_events(
             .prop("STATUS")
             .is_some_and(|p| p.value.eq_ignore_ascii_case("CANCELLED"));
         let busy = !cancelled
-            && match ev.prop("TRANSP") {
-                Some(p) => p.value.eq_ignore_ascii_case("OPAQUE"),
-                None => matches!(time, EventTime::Timed { .. }),
+            && match time {
+                EventTime::Timed { .. } => true,
+                EventTime::AllDay { .. } => ev
+                    .prop("TRANSP")
+                    .is_some_and(|p| p.value.eq_ignore_ascii_case("OPAQUE")),
             };
 
         let recurrence_id = ev.prop("RECURRENCE-ID").map(|p| p.value.to_string());
@@ -839,7 +863,7 @@ DTSTART:20261102T140000Z\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
     }
 
     #[test]
-    fn busy_follows_transp_and_status() {
+    fn busy_ignores_transp_except_for_all_day() {
         let ics = "BEGIN:VCALENDAR\r\n\
 BEGIN:VEVENT\r\nUID:a\r\nDTSTART:20261102T140000Z\r\nDTEND:20261102T150000Z\r\nEND:VEVENT\r\n\
 BEGIN:VEVENT\r\nUID:b\r\nDTSTART:20261102T140000Z\r\nTRANSP:TRANSPARENT\r\nEND:VEVENT\r\n\
@@ -852,7 +876,20 @@ END:VCALENDAR\r\n";
             .iter()
             .map(|e| e.busy)
             .collect();
-        assert_eq!(busy, [true, false, false, false, true]);
+        assert_eq!(busy, [true, true, false, false, true]);
+    }
+
+    #[test]
+    fn all_day_overlap_uses_local_dates() {
+        let ics = "BEGIN:VCALENDAR\r\n\
+BEGIN:VEVENT\r\nUID:a\r\nDTSTART;VALUE=DATE:20261130\r\nDTEND;VALUE=DATE:20261201\r\nEND:VEVENT\r\n\
+END:VCALENDAR\r\n";
+        let ev = &parse_events("/c/a.ics", "e", ics, &ny()).unwrap()[0];
+        let at = |s: &str| s.parse::<Timestamp>().unwrap();
+        // Window ends at local midnight Nov 30 (exclusive): no overlap.
+        assert!(!ev.overlaps(at("2026-11-23T05:00:00Z"), at("2026-11-30T05:00:00Z"), &ny()).unwrap());
+        // Late on Nov 30 local time is already Dec 1 in UTC: still overlaps.
+        assert!(ev.overlaps(at("2026-12-01T02:00:00Z"), at("2026-12-01T04:00:00Z"), &ny()).unwrap());
     }
 
     #[test]

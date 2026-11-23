@@ -4,7 +4,7 @@ use jiff::civil::Time as CivilTime;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ZonedDateTime};
 
-use crate::ical::{Event, EventTime};
+use crate::ical::Event;
 
 #[derive(Debug, serde::Serialize)]
 pub struct Slot {
@@ -32,7 +32,7 @@ pub fn free_slots(
     let mut busy = events
         .iter()
         .filter(|e| e.busy)
-        .map(|e| busy_interval(e, tz))
+        .map(|e| e.interval(tz))
         .collect::<Result<Vec<_>, _>>()?;
     busy.sort();
 
@@ -53,16 +53,6 @@ pub fn free_slots(
         }
     }
     Ok(slots)
-}
-
-fn busy_interval(event: &Event, tz: &TimeZone) -> Result<(Timestamp, Timestamp), jiff::Error> {
-    Ok(match &event.time {
-        EventTime::Timed { start, end } => (start.timestamp(), end.timestamp()),
-        EventTime::AllDay { start, end } => (
-            start.to_zoned_datetime(tz.clone())?.timestamp(),
-            end.to_zoned_datetime(tz.clone())?.timestamp(),
-        ),
-    })
 }
 
 /// The parts of `[start, end)` to search: all of it, or `hours` on each day.
@@ -113,6 +103,8 @@ mod tests {
     fn ts(s: &str) -> Timestamp {
         s.parse::<jiff::civil::DateTime>().unwrap().to_zoned_datetime(ny()).unwrap().timestamp()
     }
+
+    use crate::ical::EventTime;
 
     fn event(start: &str, end: &str, busy: bool) -> Event {
         Event {
