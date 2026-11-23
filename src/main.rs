@@ -80,9 +80,25 @@ async fn main() -> ExitCode {
     let webdav = WebDavClient::new(uri, https_client);
     let client = Arc::new(CalDavClient::new(webdav));
 
-    let config = StreamableHttpServerConfig::default()
+    let mut config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true);
+
+    // Host header allowlist (DNS rebinding protection). Defaults to localhost only;
+    // set MCP_ALLOWED_HOSTS to the hostname(s) clients use, or "*" to allow any.
+    if let Ok(hosts) = env::var("MCP_ALLOWED_HOSTS") {
+        let hosts: Vec<String> = hosts
+            .split(',')
+            .map(|h| h.trim().to_string())
+            .filter(|h| !h.is_empty())
+            .collect();
+        if hosts.iter().any(|h| h == "*") {
+            warn!("MCP_ALLOWED_HOSTS=*: Host header validation is disabled");
+            config = config.disable_allowed_hosts();
+        } else if !hosts.is_empty() {
+            config = config.with_allowed_hosts(hosts);
+        }
+    }
 
     let service = StreamableHttpService::new(
         move || Ok(CalMcp::new(Arc::clone(&client), tz.clone())),

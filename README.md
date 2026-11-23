@@ -23,6 +23,7 @@ Times can be given as `YYYY-MM-DD` (all-day), `YYYY-MM-DDTHH:MM` (local time in 
 | `CALDAV_USERNAME` | yes | | CalDAV username |
 | `CALDAV_PASSWORD` | yes | | CalDAV password |
 | `MCP_API_KEY` | yes | | Clients must send `Authorization: Bearer <key>` |
+| `MCP_ALLOWED_HOSTS` | no | `localhost,127.0.0.1,::1` | Comma-separated hostnames (optionally `host:port`) clients may use in the `Host` header. Set this to the public hostname when not accessed via localhost, or `*` to allow any |
 | `PORT` | no | `8000` | Port to listen on |
 | `TZ` | no | `Etc/UTC` | IANA timezone used to interpret local times |
 | `RUST_LOG` | no | | Log level, e.g. `info` |
